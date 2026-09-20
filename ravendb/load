@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Ingest the parquet corpus into RavenDB and build both indexes.
+#
+# Order matters and is not the obvious one:
+#
+#   wipe -> start -> analyzer -> traces -> logs -> INDEXES -> wait non-stale
+#
+# The indexes are created LAST, after every document is in. Creating them first
+# would mean indexing races the ingest and, worse, every traces/ document
+# written after a log that references it would re-index that log (LoadDocument
+# registers a reference). Building afterwards gives exactly one indexing pass
+# with every reference already resolvable.
+#
+# The custom analyzer must exist before the indexes, since they name it.
+#
+# load_time is measured by the driver around this whole script, so everything
+# here -- the traces collection, both indexes, and the wait for indexing to
+# finish -- is charged to RavenDB, which is correct: none of the 92 queries can
+# be answered until all of it is done.
+set -euo pipefail
+cd "$(dirname "$0")"
+. ./common.sh
+
+: "${SEARCHBENCH_DATASET:=otel_logs_1b}"
+: "${SEARCHBENCH_DATA_DIR:?SEARCHBENCH_DATA_DIR must be set to a directory containing part_*.parquet (no default)}"
+
+if [[ "${SEARCHBENCH_SKIP_LOAD:-no}" == "yes" ]]; then
+    echo "[load] SEARCHBENCH_SKIP_LOAD=yes, leaving storage as-is"
+    exit 0
+fi
+
+[[ -d "$SEARCHBENCH_DATA_DIR" ]] \
+  || { echo "missing data dir: $SEARCHBENCH_DATA_DIR" >&2; exit 1; }
+
+shopt -s nullglob
+files=( "$SEARCHBENCH_DATA_DIR"/part_*.parquet )
+shopt -u nullglob
+[[ ${#files[@]} -gt 0 ]] \
+  || { echo "no part_*.parquet in $SEARCHBENCH_DATA_DIR" >&2; exit 1; }
+
+DB_URL="${RVN_URL}/databases/${RVN_DATABASE}"
+
+# ---------------------------------------------------------------- wipe
+# Start from empty storage so load_time and data_size describe this corpus
+# only. The container owns these files as its own uid, hence the throwaway
+# root container (same idiom as victorialogs/load and postgres/install).
+echo "[load] clearing storage at $RVN_DATA_DIR"
+./stop
+docker run --rm -v "${RVN_DATA_DIR}:/d" alpine sh -c 'rm -rf /d/* /d/.[!.]* 2>/dev/null' || true
+./start >/dev/null
+
+# ------------------------------------------------------------ analyzer
+# config/analyzer.cs is C# source compiled server-side. The registered Name must
+# match the type, because AnalyzerCompiler resolves it with
+# assembly.GetType(name) and falls back to matching the short type name.
+echo "[load] installing analyzer ${RVN_ANALYZER}"
+jq -n --rawfile code config/analyzer.cs --arg name "$RVN_ANALYZER" \
+      '{Analyzers:[{Name:$name,Code:$code}]}' \
+  | curl -fsS -X PUT "${DB_URL}/admin/analyzers" \
+        -H 'Content-Type: application/json' --data-binary @- >/dev/null
+
+# -------------------------------------------------------------- traces
+# One traces/<TraceId> document per trace that touches payment, frontend or
+# cart -- the only three b-side services across Q84-Q92. See build_traces.py.
+echo "[load] building Traces collection"
+RVN_URL="$RVN_URL" RVN_DATABASE="$RVN_DATABASE" \
+  "${SEARCHBENCH_PYTHON:-python3}" ./build_traces.py --local-dir "$SEARCHBENCH_DATA_DIR"
+
+# ---------------------------------------------------------------- logs
+echo "[load] ingesting ${#files[@]} parquet part(s)"
+RVN_URL="$RVN_URL" RVN_DATABASE="$RVN_DATABASE" \
+  "${SEARCHBENCH_PYTHON:-python3}" ./ingest.py \
+      --local-dir "$SEARCHBENCH_DATA_DIR" \
+      --files "${#files[@]}"
+
+# ------------------------------------------------------------- indexes
+# _comment is stripped: RavenDB rejects unknown properties on the request body.
+echo "[load] creating indexes"
+jq 'del(._comment)' config/index.json \
+  | curl -fsS -X PUT "${DB_URL}/admin/indexes" \
+        -H 'Content-Type: application/json' --data-binary @- >/dev/null
+
+# --------------------------------------------------- wait for indexing
+# RavenDB indexes asynchronously. Returning before they settle would understate
+# load_time AND let the first queries race the indexer, so block here.
+echo "[load] waiting for indexing to complete"
+last_report=0
+while :; do
+    stats=$(curl -fsS "${DB_URL}/stats" 2>/dev/null || true)
+    [[ -n "$stats" ]] || { sleep 5; continue; }
+
+    stale=$(printf '%s' "$stats" | jq '[.Indexes[]? | select(.IsStale)] | length')
+    errored=$(printf '%s' "$stats" | jq -r '[.Indexes[]? | select(.State=="Error") | .Name] | join(",")')
+
+    if [[ -n "$errored" ]]; then
+        echo "[load] ERROR: index(es) in Error state: $errored" >&2
+        curl -fsS "${DB_URL}/indexes/errors" 2>/dev/null | jq -r '.Results[]?.Errors[]?.Error' | head -20 >&2 || true
+        exit 1
+    fi
+
+    [[ "$stale" == "0" ]] && break
+
+    now=$(date +%s)
+    if (( now - last_report >= 30 )); then
+        entries=$(printf '%s' "$stats" | jq -r '[.Indexes[]? | "\(.Name)=\(.EntriesCount // 0)"] | join(" ")')
+        echo "[load]   still indexing (${stale} stale): ${entries}"
+        last_report=$now
+    fi
+    sleep 5
+done
+
+# ---------------------------------------------------------------- done
+docs=$(curl -fsS "${DB_URL}/stats" | jq -r '.CountOfDocuments // "unknown"')
+echo "[load] documents=${docs} (Logs + Traces), indexes non-stale"

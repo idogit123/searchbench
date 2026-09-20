@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Print the running RavenDB version; labels the results JSON.
+set -euo pipefail
+cd "$(dirname "$0")"
+. ./common.sh
+
+curl -fsS --max-time 5 "${RVN_URL}/build/version" 2>/dev/null \
+  | jq -r '.FullVersion // .ProductVersion // empty' 2>/dev/null \
+  | grep . || echo unknown

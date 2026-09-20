@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# On-disk bytes of everything this engine stores to serve the workload.
+#
+# Measured with du over the data directory rather than from /stats, because
+# DocumentDatabase.GetSizeOnDisk() sums DataFileInBytes + JournalsInBytes across
+# every storage environment (DocumentDatabase.cs:1986) -- that is, it INCLUDES
+# the write-ahead journals. No other adapter charges its WAL: serenedb/data-size
+# passes du --exclude=wal, and postgres uses pg_total_relation_size, which is
+# heap + TOAST + indexes and excludes WAL. Including RavenDB's journals would
+# overstate it against the field.
+#
+# What IS counted, and should be: the documents store, both index environments
+# (Logs/Search on Corax and Logs/Fuzzy on Lucene), and the Traces collection
+# that the join queries depend on -- the direct analogue of elastic/data-size
+# summing every non-system index including its trace_lookup.
+#
+# du inside the container first (the server owns these files as its own uid),
+# falling back to the host bind mount. Same two-step as serenedb/data-size.
+set -euo pipefail
+cd "$(dirname "$0")"
+. ./common.sh
+
+exclude=( --exclude='*.journal' --exclude='Journals' --exclude='Temp' )
+
+size=$(docker exec "$RVN_CONTAINER" du -sb "${exclude[@]}" /var/lib/ravendb/data 2>/dev/null \
+       | awk '{print $1}')
+
+if [[ -z "$size" && -d "$RVN_DATA_DIR" ]]; then
+    size=$(du -sb "${exclude[@]}" "$RVN_DATA_DIR" 2>/dev/null | awk '{print $1}')
+fi
+
+# The contract is a bare integer interpolated straight into the results JSON,
+# so normalise a missing measurement to 0 rather than emitting nothing.
+echo "${size:-0}"

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Check host prereqs for the RavenDB adapter (docker backend).
+set -euo pipefail
+cd "$(dirname "$0")"
+. ./common.sh
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+for tool in curl jq python3; do
+    command -v "$tool" >/dev/null || die "required tool not on PATH: $tool"
+done
+# Same pinned set every other adapter's ingest uses (lib/requirements.txt);
+# the RavenDB ingest adds nothing to it.
+for mod in pyarrow orjson requests; do
+    "${SEARCHBENCH_PYTHON:-python3}" -c "import $mod" 2>/dev/null \
+      || die "python module '$mod' missing in '${SEARCHBENCH_PYTHON:-python3}'. Set SEARCHBENCH_PYTHON to a venv with it (pip install $mod)."
+done
+
+command -v docker >/dev/null || die "docker not on PATH"
+docker info >/dev/null 2>&1 \
+  || die "docker daemon not responding (try: systemctl start docker; or fix permissions)"
+echo "RavenDB backend: docker ($RVN_IMAGE)"
+docker pull --quiet "$RVN_IMAGE" >/dev/null   # idempotent, cheap once cached
+
+echo "RVN_DATA_DIR: $RVN_DATA_DIR"
+if [[ -f "$RVN_LICENSE_FILE" ]]; then
+    echo "license: $RVN_LICENSE_FILE"
+else
+    echo "license: none at $RVN_LICENSE_FILE -- server will run capped (see README)" >&2
+fi
+
+# Don't wipe: re-runs keep the data; ./load owns it.
+mkdir -p "$RVN_DATA_DIR"
+chmod -R a+rwX "$RVN_DATA_DIR" 2>/dev/null || true
+
+echo "Adapter ready. Run ./start to launch."

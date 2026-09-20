@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Exit 0 when the benchmark DATABASE answers; non-zero otherwise.
+#
+# Deliberately probes /databases/<db>/stats rather than a server-level endpoint:
+# the driver polls ./check both to wait for readiness and, in wait_stopped(), to
+# confirm the engine is actually down. A probe that stays green while the
+# database is unusable costs 60s per query.
+set -euo pipefail
+cd "$(dirname "$0")"
+. ./common.sh
+
+curl -fsS --max-time 3 "${RVN_URL}/databases/${RVN_DATABASE}/stats" >/dev/null 2>&1

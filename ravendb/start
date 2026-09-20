@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Launch the RavenDB container and ensure the benchmark database exists.
+# Idempotent: safe to call when already up (the driver calls it before every
+# cold query when SEARCHBENCH_RESTART=yes).
+set -euo pipefail
+cd "$(dirname "$0")"
+. ./common.sh
+
+mkdir -p "$RVN_DATA_DIR"
+chmod a+rwX "$RVN_DATA_DIR" 2>/dev/null || true
+
+# Server-level readiness, as opposed to ./check which probes the DATABASE.
+# ./start needs this weaker probe because the database does not exist yet on a
+# first run -- ./check cannot go green until we have created it below.
+server_up() {
+    curl -fsS --max-time 3 "${RVN_URL}/build/version" >/dev/null 2>&1
+}
+
+# Recreate when the image or the data mount differs from what this invocation
+# asks for -- `docker start` below reuses the container as-built, so otherwise a
+# changed RVN_DATA_DIR or image tag silently has no effect and the run reads the
+# OLD storage. This comparison must stay BEFORE the "already up" early return.
+if docker inspect "$RVN_CONTAINER" >/dev/null 2>&1; then
+    _have="$(docker inspect -f '{{.Config.Image}}|{{range .Mounts}}{{if eq .Destination "/var/lib/ravendb/data"}}{{.Source}}{{end}}{{end}}' "$RVN_CONTAINER" 2>/dev/null)"
+    _have_img="${_have%%|*}"; _have_src="${_have#*|}"
+    if [[ "$_have_img" != "$RVN_IMAGE" || "$_have_src" != "$RVN_DATA_DIR" ]]; then
+        echo "container differs from requested config; recreating"
+        docker rm -f "$RVN_CONTAINER" >/dev/null
+    fi
+fi
+
+if ./check >/dev/null 2>&1; then
+    echo "RavenDB already up on :${RVN_PORT} (database ${RVN_DATABASE})"
+    exit 0
+fi
+
+if docker inspect "$RVN_CONTAINER" >/dev/null 2>&1; then
+    docker start "$RVN_CONTAINER" >/dev/null
+else
+    license_mount=()
+    if [[ -f "$RVN_LICENSE_FILE" ]]; then
+        license_mount=(-v "${RVN_LICENSE_FILE}:/license/license.json:ro"
+                       -e RAVEN_License_Path=/license/license.json)
+    else
+        echo "WARNING: no license at $RVN_LICENSE_FILE -- running capped (see README)" >&2
+    fi
+
+    # --network host to match the ES/OS/VL adapters: no NAT in the timing path.
+    # Unsecured is fine here and only here: a throwaway benchmark server bound to
+    # loopback. Never do this with real data.
+    docker run -d \
+        --name "$RVN_CONTAINER" \
+        --network host \
+        -v "${RVN_DATA_DIR}:/var/lib/ravendb/data" \
+        "${license_mount[@]}" \
+        -e RAVEN_Setup_Mode=None \
+        -e RAVEN_License_Eula_Accepted=true \
+        -e RAVEN_Security_UnsecuredAccessAllowed=PrivateNetwork \
+        -e RAVEN_ServerUrl="http://${RVN_HOST}:${RVN_PORT}" \
+        -e RAVEN_DataDir=/var/lib/ravendb/data \
+        "$RVN_IMAGE" >/dev/null
+fi
+
+for _ in $(seq 1 180); do
+    if server_up; then
+        break
+    fi
+    sleep 1
+done
+
+if ! server_up; then
+    echo "RavenDB server did not answer within 180s." >&2
+    docker logs --tail 50 "$RVN_CONTAINER" 2>&1 >&2 || true
+    exit 1
+fi
+
+# Create the database if absent. 201 on create; an existing database answers
+# 409 Conflict, which is success for our purposes.
+if ! ./check >/dev/null 2>&1; then
+    code=$(curl -sS -o /dev/null -w '%{http_code}' \
+        -X PUT "${RVN_URL}/admin/databases?name=${RVN_DATABASE}&replicationFactor=1" \
+        -H 'Content-Type: application/json' \
+        --data-binary "$(jq -nc --arg db "$RVN_DATABASE" '{DatabaseName:$db}')" || true)
+    case "$code" in
+        200|201|409) ;;
+        *) echo "failed to create database ${RVN_DATABASE} (HTTP $code)" >&2
+           docker logs --tail 50 "$RVN_CONTAINER" 2>&1 >&2 || true
+           exit 1 ;;
+    esac
+fi
+
+for _ in $(seq 1 60); do
+    if ./check >/dev/null 2>&1; then
+        echo "RavenDB up on :${RVN_PORT} (database ${RVN_DATABASE})"
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "database ${RVN_DATABASE} did not become available within 60s." >&2
+docker logs --tail 50 "$RVN_CONTAINER" 2>&1 >&2 || true
+exit 1

@@ -1,0 +1,115 @@
+{
+  "_comment": [
+    "NOTE: ./load strips this _comment key with jq before POSTing, because",
+    "RavenDB rejects unknown properties on the request body.",
+    "",
+    "Two static indexes over the Logs collection. PUT to",
+    "/databases/<db>/admin/indexes by ./load, after config/analyzer.cs is",
+    "installed via /admin/analyzers.",
+    "",
+    "WHY TWO ENGINES",
+    "Corax cannot do fuzzy or proximity search -- CoraxQueryBuilder.cs throws",
+    "NotSupportedInCoraxException for both. That is 7 queries: Q13 (proximity)",
+    "and Q22/Q23/Q24/Q48/Q49/Q59 (fuzzy). Everything else the workload needs",
+    "(Search, Regex, StartsWith, EndsWith, Boost, Exact) Corax handles, and it",
+    "handles the distinct-count joins far better than Lucene, which materializes",
+    "the whole match set in a GatherAllCollector before deduping. So:",
+    "  Logs/Search  Corax   85 queries, including all nine joins",
+    "  Logs/Fuzzy   Lucene   the 7 fuzzy/proximity queries, 4 fields, nothing else",
+    "Together: 92/92. Routing queries across two indexes inside one adapter is",
+    "the established pattern here -- tiger picks between BM25, GIN and ~* per",
+    "query; elastic ships a second trace_lookup index. The convention is to",
+    "declare the mapping in the header and charge every auxiliary structure to",
+    "load_time and data_size, which ./data-size does by summing the whole",
+    "database.",
+    "",
+    "SearchEngineType IS A Configuration KEY, NOT A TOP-LEVEL FIELD.",
+    "IndexDefinition has no SearchEngineType property; the key is",
+    "Indexing.Static.SearchEngineType (Constants.cs:378), scoped",
+    "ServerWideOrPerDatabaseOrPerIndex. It is set EXPLICITLY on both indexes",
+    "because the default follows the LICENSE, not the version: None/Community/",
+    "Developer get Corax, Professional/Enterprise get Lucene. Developing on a dev",
+    "license and publishing from an enterprise one would flip both engines",
+    "silently -- and the joins are where the two diverge most.",
+    "",
+    "COMPUTED FIELDS",
+    "RQL 'group by' builds an AUTO MAP-REDUCE index and is unavailable over a",
+    "static index; the static-index equivalent is select facet(<field>), which",
+    "counts unique terms under an arbitrary where. Hence:",
+    "  TimestampMinute  minute bucket for the histograms Q61-Q65, which other",
+    "                   engines derive at query time (date_trunc/date_histogram).",
+    "  SeverityScope    SeverityText|ScopeName, because two facets return two",
+    "                   INDEPENDENT lists, not the key PAIRS Q67 asks for.",
+    "Both are per-document derived values, not pre-computed aggregates -- the",
+    "counting still happens at query time over whatever the filter matched.",
+    "",
+    "TRACE FLAGS",
+    "HasPayment/HasFrontend/HasCart come from traces/<TraceId> documents via",
+    "LoadDocument, the same move elastic/build_lookup.py makes with its",
+    "trace_lookup dimension index. Those documents MUST be written before the",
+    "logs: LoadDocument registers a reference, so writing a trace document after",
+    "its logs re-indexes every log referencing it.",
+    "TraceId is stored (Storage: Yes) so the distinct-count projection is served",
+    "from the index entry rather than loading one document per matching log.",
+    "The a.TraceId != '' guard needs no expression: a log with an empty TraceId",
+    "has no traces/ document, so all three flags are false and it can never",
+    "satisfy the b-side.",
+    "",
+    "REJECTED: a trace-grain term index (map fanned out one entry per token,",
+    "grouped by (TraceId, ServiceName, Term)). It works for some of the nine and",
+    "the filter would legally sit on the group-by key, but at 1B logs it yields",
+    "~10B reduce entries -- an index larger than the corpus, charged to data_size",
+    "and load_time for all 92 queries -- and it still cannot express Q86 (phrase),",
+    "Q88 or Q90, because any reduction to trace grain loses same-log token",
+    "co-occurrence. Restricting the vocabulary to the benchmark's terms to shrink",
+    "it would be precomputing the answers."
+  ],
+  "Indexes": [
+    {
+      "Name": "Logs/Search",
+      "Priority": "Normal",
+      "Configuration": {
+        "Indexing.Static.SearchEngineType": "Corax"
+      },
+      "Maps": [
+        "from log in docs.Logs let trace = LoadDocument(\"traces/\" + log.TraceId, \"Traces\") select new { Body = log.Body, ServiceName = log.ServiceName, Timestamp = (DateTime)log.Timestamp, SeverityText = log.SeverityText, SeverityNumber = log.SeverityNumber, ScopeName = log.ScopeName, TraceId = log.TraceId, TimestampMinute = new DateTime(((DateTime)log.Timestamp).Year, ((DateTime)log.Timestamp).Month, ((DateTime)log.Timestamp).Day, ((DateTime)log.Timestamp).Hour, ((DateTime)log.Timestamp).Minute, 0), SeverityScope = log.SeverityText + \"|\" + log.ScopeName, HasPayment = trace != null && trace.HasPayment == true, HasFrontend = trace != null && trace.HasFrontend == true, HasCart = trace != null && trace.HasCart == true }"
+      ],
+      "Fields": {
+        "Body": {
+          "Indexing": "Search",
+          "Analyzer": "SearchBench.NonAlphanumericLowerCaseAnalyzer",
+          "Storage": "No",
+          "TermVector": "No",
+          "Suggestions": false
+        },
+        "ServiceName": { "Indexing": "Exact", "Storage": "No" },
+        "SeverityText": { "Indexing": "Exact", "Storage": "No" },
+        "ScopeName": { "Indexing": "Exact", "Storage": "No" },
+        "SeverityScope": { "Indexing": "Exact", "Storage": "No" },
+        "TraceId": { "Indexing": "Exact", "Storage": "Yes" }
+      }
+    },
+    {
+      "Name": "Logs/Fuzzy",
+      "Priority": "Normal",
+      "Configuration": {
+        "Indexing.Static.SearchEngineType": "Lucene"
+      },
+      "Maps": [
+        "from log in docs.Logs select new { Body = log.Body, Timestamp = (DateTime)log.Timestamp, ServiceName = log.ServiceName, ScopeName = log.ScopeName }"
+      ],
+      "Fields": {
+        "Body": {
+          "Indexing": "Search",
+          "Analyzer": "SearchBench.NonAlphanumericLowerCaseAnalyzer",
+          "Storage": "No",
+          "TermVector": "No",
+          "Suggestions": false
+        },
+        "Timestamp": { "Storage": "Yes" },
+        "ServiceName": { "Indexing": "Exact", "Storage": "Yes" },
+        "ScopeName": { "Indexing": "Exact", "Storage": "Yes" }
+      }
+    }
+  ]
+}

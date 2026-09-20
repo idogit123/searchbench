@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Run one RQL query against RavenDB; timing on stderr.
+#
+# stdin  = one RQL query (one physical line -- the driver is line-based).
+# stdout = result rows, one compact JSON object or scalar per line.
+# stderr = SEARCHBENCH_ROWS=<n>, then the elapsed seconds as the LAST bare
+#          numeric line, which is what lib/benchmark.sh parses (parse_timing,
+#          regex ^\s*[0-9]+(\.[0-9]+)?\s*$ -- the last such line wins, so the
+#          SEARCHBENCH_ROWS line is ignored because it is not bare-numeric).
+#
+# The number reported is curl's %{time_total}: the client round-trip, one of the
+# two mechanisms the README sanctions. RavenDB also returns a server-side
+# DurationInMs; it is deliberately NOT emitted, because it excludes response
+# delivery and is not what the other engines report.
+#
+# Nothing is cached between invocations: each run is a fresh curl that stores no
+# response and never sends If-None-Match, so RavenDB's client-side ETag/304 path
+# cannot engage and every query is computed in full. RavenDB has no server-side
+# result cache, and its DisableCaching flag is a client-only setting the server
+# never reads -- sending it would be a no-op.
+set -euo pipefail
+cd "$(dirname "$0")"
+. ./common.sh
+
+q=$(cat)
+
+if [[ "$q" == UNSUPPORTED:* ]]; then
+    echo "${q#UNSUPPORTED: }" >&2
+    exit 3
+fi
+
+# Normalise the three response shapes this workload produces into comparable
+# rows. lib/check_results.py content-compares count and group_by, so those two
+# must come out in the forms it parses:
+#
+#   count / distinct-count  Results empty (the query ends `limit 0` or
+#                           `limit 0, 0`) -> emit TotalResults, a bare integer,
+#                           which is what normalize(task="count") reads.
+#   group_by                a facet response: Results[].Values[] of
+#                           {Range, Count} -> emit {"key":..,"count":..}, one of
+#                           the shapes parse_group_line understands.
+#   top_k / recent          ordinary projections -> emit Results[] verbatim.
+FILTER='
+if (.Results | length) == 0 then
+    .TotalResults
+elif (.Results[0] | type) == "object" and (.Results[0] | has("Values")) then
+    .Results[] | .Values[] | {key: .Range, count: .Count}
+else
+    .Results[]
+end'
+
+# Facet options travel as query parameters -- RQL has no inline form, it is
+# `select facet(Field, $p)` plus a QueryParameters entry. The group_by queries
+# that carry an ORDER BY cnt DESC LIMIT 20 reference $top20; the unlimited ones
+# use a bare facet(Field) and ignore these. Declaring them once here keeps
+# queries.dsl to one physical line per query, which the driver requires.
+# Unreferenced parameters are ignored by the server.
+payload=$(jq -nc --arg q "$q" '{
+    Query: $q,
+    QueryParameters: {
+        top20: { TermSortMode: "CountDesc", PageSize: 20 },
+        bycount: { TermSortMode: "CountDesc" }
+    }
+}')
+
+resp=$(curl -fsS -w '\n%{time_total}' -X POST "${RVN_URL}/databases/${RVN_DATABASE}/queries" \
+    -H 'Content-Type: application/json' --data-binary "$payload")
+rt=$(printf '%s\n' "$resp" | tail -n1)
+body=$(printf '%s\n' "$resp" | sed '$d')
+
+# Everything below happens AFTER the timed call and is not counted.
+rows=$(printf '%s' "$body" | jq -c "$FILTER")
+
+if [[ -z "$rows" ]]; then
+    n=0
+else
+    printf '%s\n' "$rows"
+    n=$(printf '%s\n' "$rows" | grep -c '')
+fi
+
+printf 'SEARCHBENCH_ROWS=%s\n' "$n" >&2
+printf '%s\n' "$rt" >&2
