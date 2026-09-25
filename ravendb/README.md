@@ -42,8 +42,8 @@ both engines rather than picking one:
 
 | Index | Engine | Serves |
 |---|---|---|
-| `Logs/Search` | Corax | 85 queries, including all nine joins |
-| `Logs/Fuzzy` | Lucene | Q13, Q22, Q23, Q24, Q48, Q49, Q59 — over four fields |
+| `Logs/Search` | Corax | 84 queries, including all nine joins |
+| `Logs/Fuzzy` | Lucene | Q13, Q22–Q24, Q48, Q49, Q59 (fuzzy/proximity) and Q53 |
 
 `CoraxQueryBuilder.cs` throws `NotSupportedInCoraxException` for proximity and
 for `fuzzy()`. Everything else the workload needs — `Search`, `Regex`,
@@ -52,8 +52,9 @@ distinct-count joins far better than Lucene, whose path materialises the whole
 match set in a `GatherAllCollector` before deduping, scores hits it then
 discards, and projects through a stored-fields fetch per match.
 
-**Honest cost:** `Body` dominates the footprint, so a second inverted index over
-it roughly doubles the text-index size. That is corpus-proportional, it is
+**Honest cost:** measured at 1M, `Logs/Fuzzy` uses 210 MB against `Logs/Search`’s
+733 MB — about +29% on the index footprint, since it carries four fields rather
+than eleven plus the trace flags. That is corpus-proportional, it is
 charged to `load_time` and `data_size`, and it buys seven queries that would
 otherwise be blank.
 
@@ -83,6 +84,40 @@ filter carries `StopAnalyzer.ENGLISH_STOP_WORDS_SET` — it drops the `to` out o
 `LetterTokenizer` drops digits, breaking Q12's `"…expected 200 got 500"`. The
 keyword and whitespace analyzers do not split on punctuation at all.
 
+
+### Wildcards
+
+Trailing wildcards go through `search()`: `ts_regexp('charg.*')`,
+`ts_starts_with('charg')` and `ts_like('charg%')` all mean "a token beginning
+charg", and all map to `search(Body, 'charg*')`, which RavenDB turns into a
+prefix query *before* analysis. Around 2 ms at 1M rows.
+
+Leading and mid wildcards must not use `search()`. The analyzer's `IsTokenChar`
+is `char.IsLetterOrDigit`, so it strips `*` and `?` — measured at 1M,
+`search(Body,'*tion')` returns exactly what `search(Body,'tion')` returns, which
+is 0, on *both* engines. So this is the analyzer, not a Corax limit. Instead:
+
+| spec | RQL | result at 1M |
+|---|---|---|
+| `%tion` | `endsWith(Body, 'tion')` | 113,086 |
+| `%nnec%` | `regex(Body, 'nnec')` | 30,127 |
+| `c.che` | `regex(Body, '^c.che$')` | 57,206 |
+
+On a `Search`-indexed field these match **terms**, not the raw field value:
+`regex(Body,'^c.che$')` returns exactly the count of the token `cache`, where a
+field-level match would need the whole log line to be "cache" and return ~0.
+Unanchored `regex(Body,'c.che')` gives 59,089 — `cache` plus `cached` — which is
+why Q19 is anchored. Both cost ~110 ms at 1M: a suffix or infix match has to walk
+the term dictionary, as it does in any engine.
+
+### Fuzzy thresholds
+
+`fuzzy()` takes a *similarity*, not an edit distance. Lucene's similarity is
+`1 - distance/min(len)`, and `connection` is 10 characters, so distance ≤1 is 0.9
+and distance ≤2 is 0.8. The comparison is **strictly greater than**, so passing
+the boundary value excludes the very distance it names: measured at 1M,
+`fuzzy('connektion', 0.9)` returns 0 while `0.89` returns 30,112, and
+`connektion` is distance 1 from `connection`. Hence 0.89 and 0.79.
 ## Joins (Q84–Q92)
 
 `count(DISTINCT TraceId)` over a self-join, expressed in two halves.

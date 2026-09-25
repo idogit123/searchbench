@@ -16,14 +16,46 @@ server_up() {
     curl -fsS --max-time 3 "${RVN_URL}/build/version" >/dev/null 2>&1
 }
 
-# Recreate when the image or the data mount differs from what this invocation
-# asks for -- `docker start` below reuses the container as-built, so otherwise a
-# changed RVN_DATA_DIR or image tag silently has no effect and the run reads the
-# OLD storage. This comparison must stay BEFORE the "already up" early return.
+# Networking mode. Every other adapter uses --network host so there is no NAT in
+# the timing path, and on native Linux that is what we do. Under Docker Desktop
+# it does not work: containers live in a VM, so host networking binds in THAT
+# namespace and is invisible from the WSL distro or from Windows -- the container
+# reports healthy while ./check cannot reach the port at all.
+#
+# So detect it and publish the port instead. That puts NAT in the timing path,
+# which is why it is not the default: use a native Linux docker daemon for
+# numbers you intend to publish. It is fine for validating an adapter.
+#
+# The binding also decides the unsecured-access scope, and getting this wrong
+# makes RavenDB answer 503 to every request with "the server address is not
+# configured within allowed unsecured access address range":
+#   127.0.0.1 -> Local          (loopback is NOT PrivateNetwork)
+#   0.0.0.0   -> PublicNetwork
+: "${RVN_DOCKER_DESKTOP:=$(docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -qi 'docker desktop' && echo yes || echo no)}"
+if [[ "$RVN_DOCKER_DESKTOP" == "yes" ]]; then
+    net_args=(-p "127.0.0.1:${RVN_PORT}:${RVN_PORT}")
+    bind_url="http://0.0.0.0:${RVN_PORT}"
+    unsecured="PublicNetwork"
+    net_desc="published port (Docker Desktop; NAT in the timing path)"
+else
+    net_args=(--network host)
+    bind_url="http://${RVN_HOST}:${RVN_PORT}"
+    unsecured="Local"
+    net_desc="host network"
+fi
+
+# Recreate when the image, the data mount or the networking mode differs from
+# what this invocation asks for -- `docker start` below reuses the container
+# as-built, so otherwise a changed RVN_DATA_DIR, image tag or network mode
+# silently has no effect and the run reads the OLD storage or an unreachable
+# port. This comparison must stay BEFORE the "already up" early return.
 if docker inspect "$RVN_CONTAINER" >/dev/null 2>&1; then
-    _have="$(docker inspect -f '{{.Config.Image}}|{{range .Mounts}}{{if eq .Destination "/var/lib/ravendb/data"}}{{.Source}}{{end}}{{end}}' "$RVN_CONTAINER" 2>/dev/null)"
-    _have_img="${_have%%|*}"; _have_src="${_have#*|}"
-    if [[ "$_have_img" != "$RVN_IMAGE" || "$_have_src" != "$RVN_DATA_DIR" ]]; then
+    _have="$(docker inspect -f '{{.Config.Image}}|{{range .Mounts}}{{if eq .Destination "/var/lib/ravendb/data"}}{{.Source}}{{end}}{{end}}|{{.HostConfig.NetworkMode}}' "$RVN_CONTAINER" 2>/dev/null)"
+    _have_img="${_have%%|*}"; _rest="${_have#*|}"
+    _have_src="${_rest%%|*}"; _have_net="${_rest#*|}"
+    _want_net="host"; [[ "$RVN_DOCKER_DESKTOP" == "yes" ]] && _want_net="default"
+    if [[ "$_have_img" != "$RVN_IMAGE" || "$_have_src" != "$RVN_DATA_DIR" \
+          || "$_have_net" != "$_want_net" ]]; then
         echo "container differs from requested config; recreating"
         docker rm -f "$RVN_CONTAINER" >/dev/null
     fi
@@ -45,18 +77,18 @@ else
         echo "WARNING: no license at $RVN_LICENSE_FILE -- running capped (see README)" >&2
     fi
 
-    # --network host to match the ES/OS/VL adapters: no NAT in the timing path.
-    # Unsecured is fine here and only here: a throwaway benchmark server bound to
-    # loopback. Never do this with real data.
+    # Unsecured is fine here and only here: a throwaway benchmark server whose
+    # port is reachable only from loopback. Never do this with real data.
+    echo "starting RavenDB via ${net_desc}"
     docker run -d \
         --name "$RVN_CONTAINER" \
-        --network host \
+        "${net_args[@]}" \
         -v "${RVN_DATA_DIR}:/var/lib/ravendb/data" \
         "${license_mount[@]}" \
         -e RAVEN_Setup_Mode=None \
         -e RAVEN_License_Eula_Accepted=true \
-        -e RAVEN_Security_UnsecuredAccessAllowed=PrivateNetwork \
-        -e RAVEN_ServerUrl="http://${RVN_HOST}:${RVN_PORT}" \
+        -e RAVEN_Security_UnsecuredAccessAllowed="$unsecured" \
+        -e RAVEN_ServerUrl="$bind_url" \
         -e RAVEN_DataDir=/var/lib/ravendb/data \
         "$RVN_IMAGE" >/dev/null
 fi

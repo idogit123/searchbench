@@ -55,6 +55,16 @@ end'
 # use a bare facet(Field) and ignore these. Declaring them once here keeps
 # queries.dsl to one physical line per query, which the driver requires.
 # Unreferenced parameters are ignored by the server.
+# `limit 0, 0` is this adapter's count shape: report TotalResults, not rows.
+# It cannot be inferred from the response, because a distinct count returns BOTH
+# -- TotalResults carries the deduped scalar (Corax has already applied
+# totalResults -= skippedResults) while Results still carries the deduped rows.
+# Measured at 1M on Q84: Total=5308, Skipped=10611, Rows=5308. Keying off an
+# empty Results therefore printed 5308 rows instead of one scalar for every join.
+if [[ "$q" =~ limit[[:space:]]+0[[:space:]]*,[[:space:]]*0[[:space:]]*$ ]]; then
+    FILTER='.TotalResults'
+fi
+
 payload=$(jq -nc --arg q "$q" '{
     Query: $q,
     QueryParameters: {

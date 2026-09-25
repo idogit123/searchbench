@@ -1,52 +1,20 @@
--- SearchBench 92 queries in RQL. One query per physical line -- lib/benchmark.sh
--- reads this file line by line and feeds each to ./query on stdin.
+-- SearchBench 92 queries in RQL, one per line (the driver is line-based).
+-- See README.md for the reasoning behind each choice below.
 --
--- DIALECT NOTES
+-- Counts and joins end `limit 0, 0`: ./query reports TotalResults, not rows.
+-- Joins take their distinct count from `select distinct TraceId`, with the
+-- HasPayment/HasFrontend/HasCart flags supplied by LoadDocument.
 --
--- Counts        `limit 0, 0` and ./query reports TotalResults. RavenDB answers
---               the match count without materialising rows, which is what
---               count(*) asks for.
+-- Aggregations use select facet(): RQL's `group by` builds an auto map-reduce
+-- index and is unavailable over a static index. $top20 is declared by ./query.
 --
--- Token matching  search(Body, ...) runs the field analyzer
---               (config/analyzer.cs: split on non-alphanumeric, lowercase, no
---               stemming, no stopwords), so a term here means the same token
---               the other engines match. Space-separated terms default to OR;
---               `, and` makes it AND; quotes make a phrase.
+-- Wildcards: trailing goes through search(Body, 'charg*'); leading and mid use
+-- endsWith() or regex(), because the analyzer strips '*' and '?'.
 --
--- Wildcards     ts_regexp('charg.*'), ts_starts_with('charg') and
---               ts_like('charg%') are all "a TOKEN beginning charg", so all
---               three map to search(Body, 'charg*'). RavenDB's regex() is NOT
---               used: it matches the raw field value unanchored, so 'charg.*'
---               would also hit "recharge", and it cannot use the index.
---               '%tion' -> '*tion', '%nnec%' -> '*nnec*', 'c.che' -> 'c?che'.
---
--- Fuzzy         RavenDB's fuzzy() takes a SIMILARITY, not an edit distance.
---               Lucene's similarity is 1 - distance/min(len), and 'connection'
---               is 10 characters, so distance<=1 is 0.9 and distance<=2 is 0.8.
---
--- min-should-match  RQL has no minimum_should_match, so >=2 of 4 expands to the
---               six pairwise ANDs -- the same expansion postgres/queries.sql uses.
---
--- group_by      RQL's `group by` builds an auto map-reduce index and is not
---               available over a static index; select facet(Field) is the
---               static-index equivalent. $top20 is declared by ./query and
---               carries { TermSortMode: CountDesc, PageSize: 20 } for the four
---               queries that end ORDER BY cnt DESC LIMIT 20. Q67's two-key
---               grouping reads the SeverityScope computed field, because two
---               facets would return two independent lists rather than key pairs.
---
--- Joins         count(DISTINCT TraceId) is `select distinct TraceId limit 0, 0`:
---               page size 0 plus distinct takes the isDistinctCount branch in
---               both engines, which dedups server-side and returns the count in
---               TotalResults. HasPayment/HasFrontend/HasCart come from the
---               Traces collection via LoadDocument. TraceId <> '' needs no
---               expression: a log with an empty TraceId has no trace document,
---               so all three flags are false.
---
--- Two indexes   Logs/Search is Corax and serves 85 queries. Corax supports
---               neither fuzzy nor proximity, so Q13, Q22, Q23, Q24, Q48, Q49
---               and Q59 run against Logs/Fuzzy, which is Lucene. See
---               config/index.json.
+-- Two indexes. Logs/Search is Corax and serves 84 queries. Logs/Fuzzy is Lucene
+-- and serves Q13, Q22-Q24, Q48, Q49 and Q59, which need the fuzzy and proximity
+-- Corax does not support. Q53 is there too: on 7.2.6 the Corax path for a range
+-- combined with order by score() is materially slower.
 
 -- Q01 task=count filter=term freq=hi
 from index 'Logs/Search' where search(Body, 'error') limit 0, 0
@@ -85,23 +53,23 @@ from index 'Logs/Search' where search(Body, 'ord*') limit 0, 0
 -- Q18 task=count filter=regexp freq=mid (conn.*)
 from index 'Logs/Search' where search(Body, 'conn*') limit 0, 0
 -- Q19 task=count filter=regexp freq=hi (single-char wildcard mid: c.che -> cache)
-from index 'Logs/Search' where search(Body, 'c?che') limit 0, 0
+from index 'Logs/Search' where regex(Body, '^c.che$') limit 0, 0
 -- Q20 task=count filter=prefix freq=mid (conn)
 from index 'Logs/Search' where search(Body, 'conn*') limit 0, 0
 -- Q21 task=count filter=prefix freq=hi (charg)
 from index 'Logs/Search' where search(Body, 'charg*') limit 0, 0
 -- Q22 task=count filter=fuzzy freq=mid (levenshtein distance 1)
-from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.9) limit 0, 0
+from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.89) limit 0, 0
 -- Q23 task=count filter=fuzzy freq=mid (levenshtein distance 2)
-from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.8) limit 0, 0
+from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.79) limit 0, 0
 -- Q24 task=count filter=fuzzy,prefix freq=mid (levenshtein-2 AND prefix, same 'conn' root)
-from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.8) and search(Body, 'conn*') limit 0, 0
+from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.79) and search(Body, 'conn*') limit 0, 0
 -- Q25 task=count filter=like freq=mid (prefix wildcard conn%)
 from index 'Logs/Search' where search(Body, 'conn*') limit 0, 0
 -- Q26 task=count filter=like freq=hi (suffix wildcard %tion)
-from index 'Logs/Search' where search(Body, '*tion') limit 0, 0
+from index 'Logs/Search' where endsWith(Body, 'tion') limit 0, 0
 -- Q27 task=count filter=like freq=mid (middle wildcard %nnec%)
-from index 'Logs/Search' where search(Body, '*nnec*') limit 0, 0
+from index 'Logs/Search' where regex(Body, 'nnec') limit 0, 0
 -- Q28 task=count filter=and,negation freq=hi (error but NOT cache)
 from index 'Logs/Search' where search(Body, 'error') and not search(Body, 'cache') limit 0, 0
 -- Q29 task=count filter=or,negation freq=hi (error/failed, excluding charge)
@@ -144,9 +112,9 @@ from index 'Logs/Search' where search(Body, 'conn*') order by score() desc selec
 -- Q47 task=top_k filter=prefix freq=hi (charg)
 from index 'Logs/Search' where search(Body, 'charg*') order by score() desc select Timestamp, ServiceName, Body limit 100
 -- Q48 task=top_k filter=fuzzy freq=mid (levenshtein distance 1)
-from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.9) order by score() desc select Timestamp, ServiceName, Body limit 100
+from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.89) order by score() desc select Timestamp, ServiceName, Body limit 100
 -- Q49 task=top_k filter=fuzzy freq=mid (levenshtein distance 2)
-from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.8) order by score() desc select Timestamp, ServiceName, Body limit 100
+from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.79) order by score() desc select Timestamp, ServiceName, Body limit 100
 -- Q50 task=top_k filter=like freq=mid (prefix wildcard conn%)
 from index 'Logs/Search' where search(Body, 'conn*') order by score() desc select Timestamp, ServiceName, Body limit 100
 -- Q51 task=top_k filter=phrase,or freq=hi (phrase OR term)
@@ -154,7 +122,7 @@ from index 'Logs/Search' where search(Body, '"failed to place order"') or search
 -- Q52 task=top_k filter=and,negation freq=hi (error but NOT cache)
 from index 'Logs/Search' where search(Body, 'error') and not search(Body, 'cache') order by score() desc select Timestamp, ServiceName, Body limit 100
 -- Q53 task=top_k filter=and,window freq=hi (term + service + Timestamp BETWEEN 6h)
-from index 'Logs/Search' where ServiceName = 'payment' and search(Body, 'charge') and Timestamp between '2025-09-23T00:00:00.0000000Z' and '2025-09-23T06:00:00.0000000Z' order by score() desc select Timestamp, ServiceName, Body limit 100
+from index 'Logs/Fuzzy' where ServiceName = 'payment' and search(Body, 'charge') and Timestamp between '2025-09-23T00:00:00.0000000Z' and '2025-09-23T06:00:00.0000000Z' order by score() desc select Timestamp, ServiceName, Body limit 100
 
 -- Q54 task=group_by filter=or freq=hi (key=SeverityText, ordered)
 from index 'Logs/Search' where search(Body, 'error failed') select facet(SeverityText)
@@ -167,7 +135,7 @@ from index 'Logs/Search' where search(Body, 'error failed') select facet(ScopeNa
 -- Q58 task=group_by filter=regexp freq=hi (key=ScopeName)
 from index 'Logs/Search' where search(Body, 'charg*') select facet(ScopeName, $top20)
 -- Q59 task=group_by filter=fuzzy freq=mid (key=ScopeName)
-from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.9) select facet(ScopeName, $top20)
+from index 'Logs/Fuzzy' where fuzzy(Body = 'connection', 0.89) select facet(ScopeName, $top20)
 -- Q60 task=group_by filter=or freq=hi (key=ScopeName, NO order by)
 from index 'Logs/Search' where search(Body, 'error failed') select facet(ScopeName)
 -- Q61 task=group_by filter=term freq=hi (key=minute)
