@@ -50,12 +50,18 @@ fi
 # silently has no effect and the run reads the OLD storage or an unreachable
 # port. This comparison must stay BEFORE the "already up" early return.
 if docker inspect "$RVN_CONTAINER" >/dev/null 2>&1; then
-    _have="$(docker inspect -f '{{.Config.Image}}|{{range .Mounts}}{{if eq .Destination "/var/lib/ravendb/data"}}{{.Source}}{{end}}{{end}}|{{.HostConfig.NetworkMode}}' "$RVN_CONTAINER" 2>/dev/null)"
+    _have="$(docker inspect -f '{{.Config.Image}}|{{range .Mounts}}{{if eq .Destination "/var/lib/ravendb/data"}}{{.Source}}{{end}}{{end}}|{{.HostConfig.NetworkMode}}|{{range .Mounts}}{{if eq .Destination "/license/license.json"}}yes{{end}}{{end}}' "$RVN_CONTAINER" 2>/dev/null)"
     _have_img="${_have%%|*}"; _rest="${_have#*|}"
-    _have_src="${_rest%%|*}"; _have_net="${_rest#*|}"
+    _have_src="${_rest%%|*}"; _rest="${_rest#*|}"
+    _have_net="${_rest%%|*}"; _have_lic="${_rest#*|}"
     _want_net="host"; [[ "$RVN_DOCKER_DESKTOP" == "yes" ]] && _want_net="default"
+    # The licence has to be part of this comparison. It is a bind mount fixed at
+    # creation, so a container built before license.json existed keeps running
+    # unlicensed -- capped to 3 cores, 6 GB, and no documents compression --
+    # while ./check stays green and nothing looks wrong.
+    _want_lic=""; [[ -f "$RVN_LICENSE_FILE" ]] && _want_lic="yes"
     if [[ "$_have_img" != "$RVN_IMAGE" || "$_have_src" != "$RVN_DATA_DIR" \
-          || "$_have_net" != "$_want_net" ]]; then
+          || "$_have_net" != "$_want_net" || "$_have_lic" != "$_want_lic" ]]; then
         echo "container differs from requested config; recreating"
         docker rm -f "$RVN_CONTAINER" >/dev/null
     fi
@@ -104,6 +110,26 @@ if ! server_up; then
     echo "RavenDB server did not answer within 180s." >&2
     docker logs --tail 50 "$RVN_CONTAINER" 2>&1 >&2 || true
     exit 1
+fi
+
+# Activate the licence. RAVEN_License_Path alone does not apply it -- the server
+# comes up as "None" (3 cores, 6 GB, no documents compression) with nothing in
+# the log to say why -- so POST it explicitly. This also has to happen on every
+# start, not just the first: the activated licence lives in the system database
+# under the data directory, and ./load wipes that directory, so a reload would
+# silently drop back to unlicensed and produce numbers nobody could compare.
+if [[ -f "$RVN_LICENSE_FILE" ]]; then
+    _lic_type=$(curl -fsS --max-time 5 "${RVN_URL}/license/status" 2>/dev/null \
+                | jq -r '.Type // "None"' 2>/dev/null)
+    if [[ "$_lic_type" == "None" ]]; then
+        if curl -fsS -X POST "${RVN_URL}/admin/license/activate" \
+             -H 'Content-Type: application/json' \
+             --data-binary @"$RVN_LICENSE_FILE" >/dev/null 2>&1; then
+            echo "licence activated: $(curl -fsS "${RVN_URL}/license/status" 2>/dev/null | jq -r '"\(.Type), \(.MaxCores) cores, \(.MaxMemory) GB"')"
+        else
+            echo "WARNING: licence activation failed -- running capped" >&2
+        fi
+    fi
 fi
 
 # Create the database if absent. 201 on create; an existing database answers
