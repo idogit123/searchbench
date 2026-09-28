@@ -11,9 +11,10 @@ Unlike the VictoriaLogs adapter there is no lowercased Body copy: RavenDB has a
 real analyzer stage, and config/analyzer.cs does the lowercasing at index time
 the way every other engine's analyzer does.
 
-Run build_traces.py BEFORE this. The indexes are created afterwards by ./load,
-so there is exactly one indexing pass over both collections and LoadDocument
-resolves every reference on the first go.
+Each log also carries the three trace flags Q84-Q92 join on, written here
+rather than resolved by the index with LoadDocument -- see trace_flags.py for
+the measurement that motivated that. The indexes are created afterwards by
+./load, so there is exactly one indexing pass over the finished documents.
 """
 
 import argparse
@@ -28,6 +29,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import requests
 
+import trace_flags
 from rvn_bulk import bulk_insert
 
 RVN_URL = os.environ.get("RVN_URL", "http://127.0.0.1:8080")
@@ -54,6 +56,11 @@ _FIELD_RENAME = {
     "logattributes": "LogAttributes",
 }
 _FIELD_TARGETS = set(_FIELD_RENAME.values())
+
+# Per-trace flags, built once in main() BEFORE the worker Pool forks, so every
+# worker inherits the same Arrow buffers instead of building or copying its own.
+_FLAG_IDS = None
+_FLAG_COLS = {}
 
 
 def _canonical_field(name: str):
@@ -96,20 +103,41 @@ def _ts_iso(col):
     ).to_pylist()
 
 
+def _trace_flags(trace_col, n):
+    """The log's own trace flags, one value per row, in batch order.
+
+    pc.index_in, not a join: a hash join does not promise to preserve row order,
+    and these columns have to stay aligned with the rest of the batch. A trace
+    touching none of the three services is absent from the lookup, so index_in
+    returns null and fills to false -- the same outcome the missing traces/
+    document used to produce.
+    """
+    if trace_col is None or _FLAG_IDS is None or len(_FLAG_IDS) == 0:
+        return {f: [False] * n for f in trace_flags.FLAG_FIELDS}
+    idx = pc.index_in(trace_col, value_set=_FLAG_IDS)
+    return {f: pc.fill_null(pc.take(col, idx), False).to_pylist()
+            for f, col in _FLAG_COLS.items()}
+
+
 def batch_to_documents(batch: pa.RecordBatch, id_prefix: str):
     """RecordBatch -> (document_id, dict) pairs for rvn_bulk."""
     cols = {}
+    trace_col = None
     for name in batch.schema.names:
         out = _canonical_field(name)
         if out is None:
             continue
         col = batch.column(name)
+        if out == "TraceId":
+            trace_col = col
         if pa.types.is_timestamp(col.type):
             cols[out] = _ts_iso(col)
         elif pa.types.is_map(col.type):
             cols[out] = [dict(v) if v is not None else None for v in col.to_pylist()]
         else:
             cols[out] = col.to_pylist()
+
+    cols.update(_trace_flags(trace_col, batch.num_rows))
 
     names = list(cols.keys())
     values = list(cols.values())
@@ -211,10 +239,19 @@ def main():
     p.add_argument("--local-dir", default="/tmp")
     args = p.parse_args()
 
+    paths = [os.path.join(args.local_dir, f"part_{fn:03d}.parquet")
+             for fn in range(args.start_file, args.start_file + args.files)]
+
     t0 = time.monotonic()
+
+    # Before any Pool exists: these globals have to be in place at fork time.
+    global _FLAG_IDS, _FLAG_COLS
+    _FLAG_IDS, _FLAG_COLS = trace_flags.build(paths)
+    print(f"[flags] {len(_FLAG_IDS):,} traces touch payment/frontend/cart "
+          f"({time.monotonic() - t0:.1f}s)", flush=True)
+
     grand = 0
-    for fn in range(args.start_file, args.start_file + args.files):
-        path = os.path.join(args.local_dir, f"part_{fn:03d}.parquet")
+    for fn, path in enumerate(paths, start=args.start_file):
         grand += process_file(path, fn, args.batch_size, args.processes, args.writers)
     elapsed = time.monotonic() - t0
     print(f"\nGrand total: {grand:,} docs in {elapsed:.1f}s  ({grand/elapsed:,.0f} docs/s)")

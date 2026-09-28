@@ -44,16 +44,31 @@
     "counting still happens at query time over whatever the filter matched.",
     "",
     "TRACE FLAGS",
-    "HasPayment/HasFrontend/HasCart come from traces/<TraceId> documents via",
-    "LoadDocument, the same move elastic/build_lookup.py makes with its",
-    "trace_lookup dimension index. Those documents MUST be written before the",
-    "logs: LoadDocument registers a reference, so writing a trace document after",
-    "its logs re-indexes every log referencing it.",
-    "TraceId is stored (Storage: Yes) so the distinct-count projection is served",
-    "from the index entry rather than loading one document per matching log.",
-    "The a.TraceId != '' guard needs no expression: a log with an empty TraceId",
-    "has no traces/ document, so all three flags are false and it can never",
-    "satisfy the b-side.",
+    "HasPayment/HasFrontend/HasCart are read straight off the log document.",
+    "ingest.py writes them there; trace_flags.py computes them in one pass over",
+    "the parquet, the same scan that used to build a traces/ collection.",
+    "",
+    "They are NOT pulled in with LoadDocument, which is the obvious spelling and",
+    "was the first design here. LoadDocument registers an index reference so that",
+    "editing a trace re-indexes its logs, and on this shape -- 1M logs each",
+    "referencing one of ~102k traces by a 32-char random hex id -- that",
+    "bookkeeping measured 383 MB, against 25 MB for the three boolean fields and",
+    "8.2 MB for the trace documents themselves. More than every log document in",
+    "the database. There is no way to switch it off, and there should not be: an",
+    "index with stale LoadDocument results looks healthy and answers wrong. It is",
+    "a correctness mechanism for a corpus that changes, and this one never does.",
+    "",
+    "The trade is explicit: the flags are a denormalised copy that would not",
+    "self-heal if a trace changed. Nothing in this benchmark changes one.",
+    "elastic/build_lookup.py precomputes the same three flags for the same three",
+    "services.",
+    "",
+    "TraceId is stored but NOT indexed. All nine uses are `select distinct",
+    "TraceId`, never a filter, so the projection is served from the index entry",
+    "while Corax is spared a term dictionary of a million distinct hex strings.",
+    "A log with an empty TraceId is absent from the flag scan, so all three flags",
+    "are false and it can never satisfy the b-side -- which is why the SQL's",
+    "a.TraceId != '' guard needs no equivalent.",
     "",
     "REJECTED: a trace-grain term index (map fanned out one entry per token,",
     "grouped by (TraceId, ServiceName, Term)). It works for some of the nine and",
@@ -72,7 +87,7 @@
         "Indexing.Static.SearchEngineType": "Corax"
       },
       "Maps": [
-        "from log in docs.Logs let trace = LoadDocument(\"traces/\" + log.TraceId, \"Traces\") select new { Body = log.Body, ServiceName = log.ServiceName, Timestamp = (DateTime)log.Timestamp, SeverityText = log.SeverityText, SeverityNumber = log.SeverityNumber, ScopeName = log.ScopeName, TraceId = log.TraceId, TimestampMinute = new DateTime(((DateTime)log.Timestamp).Year, ((DateTime)log.Timestamp).Month, ((DateTime)log.Timestamp).Day, ((DateTime)log.Timestamp).Hour, ((DateTime)log.Timestamp).Minute, 0), SeverityScope = log.SeverityText + \"|\" + log.ScopeName, HasPayment = trace != null && trace.HasPayment == true, HasFrontend = trace != null && trace.HasFrontend == true, HasCart = trace != null && trace.HasCart == true }"
+        "from log in docs.Logs select new { Body = log.Body, ServiceName = log.ServiceName, Timestamp = (DateTime)log.Timestamp, SeverityText = log.SeverityText, SeverityNumber = log.SeverityNumber, ScopeName = log.ScopeName, TraceId = log.TraceId, TimestampMinute = new DateTime(((DateTime)log.Timestamp).Year, ((DateTime)log.Timestamp).Month, ((DateTime)log.Timestamp).Day, ((DateTime)log.Timestamp).Hour, ((DateTime)log.Timestamp).Minute, 0), SeverityScope = log.SeverityText + \"|\" + log.ScopeName, HasPayment = log.HasPayment, HasFrontend = log.HasFrontend, HasCart = log.HasCart }"
       ],
       "Fields": {
         "Body": {
@@ -82,11 +97,26 @@
           "TermVector": "No",
           "Suggestions": false
         },
-        "ServiceName": { "Indexing": "Exact", "Storage": "No" },
-        "SeverityText": { "Indexing": "Exact", "Storage": "No" },
-        "ScopeName": { "Indexing": "Exact", "Storage": "No" },
-        "SeverityScope": { "Indexing": "Exact", "Storage": "No" },
-        "TraceId": { "Indexing": "Exact", "Storage": "Yes" }
+        "ServiceName": {
+          "Indexing": "Exact",
+          "Storage": "No"
+        },
+        "SeverityText": {
+          "Indexing": "Exact",
+          "Storage": "No"
+        },
+        "ScopeName": {
+          "Indexing": "Exact",
+          "Storage": "No"
+        },
+        "SeverityScope": {
+          "Indexing": "Exact",
+          "Storage": "No"
+        },
+        "TraceId": {
+          "Indexing": "No",
+          "Storage": "Yes"
+        }
       }
     },
     {
@@ -106,9 +136,17 @@
           "TermVector": "No",
           "Suggestions": false
         },
-        "Timestamp": { "Storage": "Yes" },
-        "ServiceName": { "Indexing": "Exact", "Storage": "Yes" },
-        "ScopeName": { "Indexing": "Exact", "Storage": "Yes" }
+        "Timestamp": {
+          "Storage": "No"
+        },
+        "ServiceName": {
+          "Indexing": "Exact",
+          "Storage": "No"
+        },
+        "ScopeName": {
+          "Indexing": "Exact",
+          "Storage": "No"
+        }
       }
     }
   ]

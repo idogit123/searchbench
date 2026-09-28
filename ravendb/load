@@ -3,20 +3,18 @@
 #
 # Order matters and is not the obvious one:
 #
-#   wipe -> start -> analyzer -> traces -> logs -> INDEXES -> wait non-stale
+#   wipe -> start -> analyzer -> compression -> logs -> INDEXES -> wait non-stale
 #
 # The indexes are created LAST, after every document is in. Creating them first
-# would mean indexing races the ingest and, worse, every traces/ document
-# written after a log that references it would re-index that log (LoadDocument
-# registers a reference). Building afterwards gives exactly one indexing pass
-# with every reference already resolvable.
+# would mean indexing races the ingest, for one indexing pass over finished
+# documents instead of two over moving ones.
 #
 # The custom analyzer must exist before the indexes, since they name it.
 #
 # load_time is measured by the driver around this whole script, so everything
-# here -- the traces collection, both indexes, and the wait for indexing to
-# finish -- is charged to RavenDB, which is correct: none of the 92 queries can
-# be answered until all of it is done.
+# here -- the trace-flag scan, both indexes, and the wait for indexing to finish
+# -- is charged to RavenDB, which is correct: none of the 92 queries can be
+# answered until all of it is done.
 set -euo pipefail
 cd "$(dirname "$0")"
 . ./common.sh
@@ -59,14 +57,37 @@ jq -n --rawfile code config/analyzer.cs --arg name "$RVN_ANALYZER" \
   | curl -fsS -X PUT "${DB_URL}/admin/analyzers" \
         -H 'Content-Type: application/json' --data-binary @- >/dev/null
 
-# -------------------------------------------------------------- traces
-# One traces/<TraceId> document per trace that touches payment, frontend or
-# cart -- the only three b-side services across Q84-Q92. See build_traces.py.
-echo "[load] building Traces collection"
-RVN_URL="$RVN_URL" RVN_DATABASE="$RVN_DATABASE" \
-  "${SEARCHBENCH_PYTHON:-python3}" ./build_traces.py --local-dir "$SEARCHBENCH_DATA_DIR"
+
+# ---------------------------------------------------------- compression
+# RavenDB's per-collection document compression is OFF by default. It trains a
+# Zstd dictionary on the collection's own content, which is close to ideal for
+# this corpus: 47% of each record is a ResourceAttributes map whose KEYS are
+# identical across all documents and whose values repeat heavily (78 distinct
+# blobs per 200 documents at 1M), while Body -- the only field any query
+# searches -- is 6%.
+#
+# This is parity with the field, not an advantage: ClickHouse declares
+# CODEC(ZSTD(1)), Elastic/OpenSearch/CrateDB set best_compression, and engines
+# that configure nothing (VictoriaLogs, SereneDB) compress by default. RavenDB
+# is the one that needs asking.
+#
+# Must be set BEFORE ingest -- it applies to documents as they are written.
+# Requires a licence: unlicensed servers answer 402 LicenseLimitException. Not
+# fatal -- the adapter still loads and queries correctly, it just stores several
+# times more bytes than it needs to -- so warn and carry on.
+echo "[load] enabling documents compression"
+if curl -fsS -X POST "${DB_URL}/admin/documents-compression/config" \
+    -H 'Content-Type: application/json' \
+    --data-binary '{"Collections":[],"CompressRevisions":false,"CompressAllCollections":true}' >/dev/null 2>&1; then
+    echo "[load]   documents compression on"
+else
+    echo "[load]   WARNING: documents compression refused (needs a licence) -- data_size will be several times larger" >&2
+fi
 
 # ---------------------------------------------------------------- logs
+# ingest.py scans the corpus for the per-trace service flags first (one pass,
+# reported as [flags]), then writes each log with its own three booleans
+# attached. There is no separate Traces collection -- see trace_flags.py.
 echo "[load] ingesting ${#files[@]} parquet part(s)"
 RVN_URL="$RVN_URL" RVN_DATABASE="$RVN_DATABASE" \
   "${SEARCHBENCH_PYTHON:-python3}" ./ingest.py \
@@ -111,4 +132,4 @@ done
 
 # ---------------------------------------------------------------- done
 docs=$(curl -fsS "${DB_URL}/stats" | jq -r '.CountOfDocuments // "unknown"')
-echo "[load] documents=${docs} (Logs + Traces), indexes non-stale"
+echo "[load] documents=${docs}, indexes non-stale"

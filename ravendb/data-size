@@ -9,10 +9,11 @@
 # heap + TOAST + indexes and excludes WAL. Including RavenDB's journals would
 # overstate it against the field.
 #
-# What IS counted, and should be: the documents store, both index environments
-# (Logs/Search on Corax and Logs/Fuzzy on Lucene), and the Traces collection
-# that the join queries depend on -- the direct analogue of elastic/data-size
-# summing every non-system index including its trace_lookup.
+# What IS counted, and should be: the documents store and both index
+# environments (Logs/Search on Corax, Logs/Fuzzy on Lucene) -- the direct
+# analogue of elastic/data-size summing every non-system index including its
+# trace_lookup. The join queries need no auxiliary collection here: their three
+# flags are fields on the log documents, already counted.
 #
 # du inside the container first (the server owns these files as its own uid),
 # falling back to the host bind mount. Same two-step as serenedb/data-size.

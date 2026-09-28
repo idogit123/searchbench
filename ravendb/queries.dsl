@@ -3,7 +3,8 @@
 --
 -- Counts and joins end `limit 0, 0`: ./query reports TotalResults, not rows.
 -- Joins take their distinct count from `select distinct TraceId`, with the
--- HasPayment/HasFrontend/HasCart flags supplied by LoadDocument.
+-- HasPayment/HasFrontend/HasCart are fields on each log, written at load
+-- time from a single pass over the corpus (see trace_flags.py).
 --
 -- Aggregations use select facet(): RQL's `group by` builds an auto map-reduce
 -- index and is unavailable over a static index. $top20 is declared by ./query.

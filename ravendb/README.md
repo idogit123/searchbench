@@ -122,17 +122,43 @@ the boundary value excludes the very distance it names: measured at 1M,
 
 `count(DISTINCT TraceId)` over a self-join, expressed in two halves.
 
-**The join half** is `LoadDocument`. `build_traces.py` writes one
-`traces/<TraceId>` document per trace carrying `HasPayment` / `HasFrontend` /
-`HasCart` — the only three b-side services across the nine queries — and
-`config/index.json` pulls them into the log index, flattening the join into an
-ordinary predicate. Same move `elastic/build_lookup.py` makes, and like Elastic
-we charge those bytes to `data_size` and that work to `load_time`.
+**The join half** is three booleans on each log document. `trace_flags.py` makes
+one streaming pass over the parquet, collecting for every trace whether it
+touches `payment`, `frontend` or `cart` — the only three b-side services across
+the nine queries — and `ingest.py` writes `HasPayment` / `HasFrontend` /
+`HasCart` onto each log as it goes, flattening the join into an ordinary
+predicate. Same move `elastic/build_lookup.py` makes for the same three
+services, and like Elastic we charge that work to `load_time`.
 
-Only traces touching at least one flag service get a document: every join filters
+Only traces touching at least one flag service get an entry: every join filters
 `Has<B> = true`, so a trace touching none of them can never survive. This also
-makes the SQL's `a.TraceId <> ''` guard unnecessary — an empty TraceId has no
-document, so all three flags read false.
+makes the SQL's `a.TraceId <> ''` guard unnecessary — an empty TraceId is never
+a key in the scan, so all three flags read false.
+
+### Why not `LoadDocument`
+
+Because it costs 383 MB at 1M rows, measured.
+
+The idiomatic spelling is a `traces/<TraceId>` document per trace pulled into the
+index with `LoadDocument`, and that was the first design here. But `LoadDocument`
+registers an index **reference**: RavenDB records, per referencing document, what
+it loaded, and per referenced document, who loaded it, so that editing a trace
+re-indexes every log that read it. On this shape — 1M logs each referencing one
+of ~102k traces by a 32-character random hex id — that bookkeeping was 383 MB,
+against 25 MB for the three boolean fields themselves and 8.2 MB for the whole
+`Traces` collection. More than every log document in the database.
+
+Isolated by building both indexes over the same loaded corpus: identical map,
+identical three booleans, derived locally in one and through `LoadDocument` in
+the other. 164.1 MB against 547.3 MB.
+
+There is no setting to disable it, and there should not be — an index with stale
+`LoadDocument` results looks perfectly healthy and answers wrong. It is what
+makes incremental indexing correct on a corpus that changes. This one loads once
+and never touches a trace again, so the tree is paid for and never used.
+
+The trade is explicit and worth stating: the flags are a denormalised copy and
+would not self-heal if a trace changed.
 
 **The counting half** is a distinct projection with page size zero:
 
@@ -155,7 +181,8 @@ matching log.
 
 No engine in this benchmark precomputes the distinct — ClickHouse, Postgres,
 tiger, ParadeDB, ArangoDB and SereneDB all build it at query time. Elasticsearch
-precomputes only the join half, which is exactly what `LoadDocument` does here.
+precomputes only the join half, which is exactly what `trace_flags.py` does
+here.
 
 **Considered and rejected:** a trace-grain term index, fanning the map out one
 entry per token grouped by `(TraceId, ServiceName, Term)`. It works for some of
@@ -202,13 +229,12 @@ serialises with stdlib `json` rather than `orjson`, and makes a redundant
 ## Load order
 
 ```
-wipe → start → analyzer → traces → logs → INDEXES → wait until non-stale
+wipe → start → analyzer → compression → logs → INDEXES → wait until non-stale
 ```
 
 Indexes are created **last**, after every document is in, so there is exactly one
-indexing pass and every `LoadDocument` reference resolves on the first go.
-Creating them first would race the ingest, and any `traces/` document written
-after a log referencing it would re-index that log.
+indexing pass over finished documents rather than two over moving ones. Creating
+them first would race the ingest.
 
 `./load` blocks until no index is stale. RavenDB indexes asynchronously, so
 returning early would both understate `load_time` and let the first queries race
@@ -233,5 +259,6 @@ flag is client-only — the server never reads it, so sending it would be a no-o
 `DataFileInBytes + JournalsInBytes` across every storage environment
 (`DocumentDatabase.cs:1986`), i.e. it includes the write-ahead journals — and no
 other adapter charges its WAL (`serenedb/data-size` passes `--exclude=wal`;
-Postgres uses `pg_total_relation_size`). Counted: the documents store, both index
-environments, and the `Traces` collection.
+Postgres uses `pg_total_relation_size`). Counted: the documents store and both
+index environments. The joins need no auxiliary collection — their three flags
+are fields on the log documents, already counted.
