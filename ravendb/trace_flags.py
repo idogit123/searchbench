@@ -6,8 +6,8 @@ predicate, and also a log from service X -- where X is only ever payment,
 frontend or cart. So each trace needs three booleans, and every log needs to know
 its own trace's three booleans.
 
-This module does one streaming pass over the parquet and returns the flags as
-Arrow arrays. ingest.py then writes them onto each log document.
+This module does one streaming pass over the parquet and returns the flags as a
+dict, trace id -> bitmask. ingest.py then writes them onto each log document.
 
 WHY ON THE DOCUMENT, AND NOT VIA LoadDocument
 The obvious RavenDB spelling is a traces/<TraceId> document per trace, pulled
@@ -32,6 +32,19 @@ million times. Consequence to be aware of: the flags are a denormalised copy, so
 they would NOT self-heal if a trace changed. Nothing in this benchmark changes
 one. Elasticsearch precomputes the same three flags for the same three services
 in elastic/build_lookup.py.
+
+WHY A PLAIN DICT
+ingest.py looks every log's trace id up in this table. The vectorised-looking
+way is Arrow's pc.index_in against an array of the flagged ids, and that was the
+first version here. But Arrow rebuilds its hash table from the whole value set on
+EVERY call, and ingest.py calls it once per 50,000-row batch. Measured, per
+batch: 12 ms with 100k flagged traces, 170 ms with 1M, 736 ms with 4M -- linear in
+the size of the set. Invisible at 1M rows (102k traces); at 1B rows, if the
+flagged-trace count grows with the rows to ~100M, about 18 s per batch over
+20,000 batches, i.e. ~100 CPU-hours, plus a 100M-entry table rebuilt in every
+worker. A dict lookup costs ~100 ns per row at any size. What it costs instead is
+memory, an estimated 15-25 GB at 1B; ingest.py builds it before forking its
+workers so they share it rather than copy it.
 """
 
 import argparse
@@ -40,7 +53,6 @@ import os
 import sys
 import time
 
-import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
@@ -48,6 +60,7 @@ import pyarrow.parquet as pq
 # b.ServiceName predicate is payment (Q84-86, Q91), frontend (Q87, Q89, Q90,
 # Q92) or cart (Q88).
 FLAG_SERVICES = ["payment", "frontend", "cart"]
+FLAG_BITS = [1 << i for i in range(len(FLAG_SERVICES))]
 FLAG_FIELDS = ["HasPayment", "HasFrontend", "HasCart"]
 
 
@@ -64,11 +77,16 @@ def _column(batch, *candidates):
     raise KeyError(f"none of {candidates} in parquet schema {sorted(names)}")
 
 
-def scan(files):
-    """tid -> bitmask over FLAG_SERVICES.
+def build(files):
+    """tid -> bitmask over FLAG_SERVICES (bit i set: a log from FLAG_SERVICES[i]).
 
     Only flag-service rows materialise to Python, so the work scales with the
     relevant subset rather than the whole corpus.
+
+    Only traces touching at least one flag service get an entry. A log whose
+    trace is absent reads false for all three and can never satisfy the b-side,
+    which is also why the SQL's `a.TraceId <> ''` guard needs no equivalent: an
+    empty TraceId is never a key here.
     """
     bit = {s: 1 << i for i, s in enumerate(FLAG_SERVICES)}
     flags = {}
@@ -88,27 +106,6 @@ def scan(files):
     return flags
 
 
-def build(files):
-    """-> (trace ids, {field: booleans}), as Arrow arrays aligned by position.
-
-    Arrow rather than the dict itself because ingest.py looks these up once per
-    log: pc.index_in over a string array is vectorised and holds the ids in
-    Arrow's buffers instead of a Python object per trace. ingest.py builds this
-    once before forking its worker pool, so the arrays are shared, not copied.
-
-    Only traces touching at least one flag service get an entry. A log whose
-    trace is absent reads false for all three and can never satisfy the b-side,
-    which is also why the SQL's `a.TraceId <> ''` guard needs no equivalent: an
-    empty TraceId is never a key here.
-    """
-    flags = scan(files)
-    ids = pa.array(list(flags.keys()), type=pa.string())
-    masks = list(flags.values())
-    cols = {f: pa.array([bool(m & (1 << i)) for m in masks], type=pa.bool_())
-            for i, f in enumerate(FLAG_FIELDS)}
-    return ids, cols
-
-
 def main():
     p = argparse.ArgumentParser(description="Report the flag scan without ingesting.")
     p.add_argument("--local-dir", required=True)
@@ -119,11 +116,11 @@ def main():
         sys.exit(f"no part_*.parquet in {args.local_dir}")
 
     t0 = time.monotonic()
-    ids, cols = build(files)
-    print(f"[flags] {len(ids):,} traces touch a flag service "
+    flags = build(files)
+    print(f"[flags] {len(flags):,} traces touch a flag service "
           f"({time.monotonic() - t0:.1f}s)")
-    for f, col in cols.items():
-        print(f"[flags]   {f}: {pc.sum(col).as_py():,}")
+    for f, bit in zip(FLAG_FIELDS, FLAG_BITS):
+        print(f"[flags]   {f}: {sum(1 for m in flags.values() if m & bit):,}")
 
 
 if __name__ == "__main__":

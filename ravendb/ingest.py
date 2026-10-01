@@ -57,10 +57,9 @@ _FIELD_RENAME = {
 }
 _FIELD_TARGETS = set(_FIELD_RENAME.values())
 
-# Per-trace flags, built once in main() BEFORE the worker Pool forks, so every
-# worker inherits the same Arrow buffers instead of building or copying its own.
-_FLAG_IDS = None
-_FLAG_COLS = {}
+# Per-trace flags (trace id -> bitmask), built once in main() BEFORE the worker
+# Pool forks, so every worker inherits the same table instead of building its own.
+_FLAGS = {}
 
 
 def _canonical_field(name: str):
@@ -103,33 +102,35 @@ def _ts_iso(col):
     ).to_pylist()
 
 
-def _trace_flags(trace_col, n):
+def _trace_flags(trace_ids, n):
     """The log's own trace flags, one value per row, in batch order.
 
-    pc.index_in, not a join: a hash join does not promise to preserve row order,
-    and these columns have to stay aligned with the rest of the batch. A trace
-    touching none of the three services is absent from the lookup, so index_in
-    returns null and fills to false -- the same outcome the missing traces/
-    document used to produce.
+    A dict lookup per row, not an Arrow one: pc.index_in rebuilds its hash table
+    from the whole flagged-trace list on every call, which grows with the corpus
+    (see trace_flags.py for the measurement). A list comprehension keeps the
+    columns aligned with the rest of the batch by construction. A trace touching
+    none of the three services is absent from the table and reads 0, so all three
+    flags are false.
+
+    The values must be real bools: orjson would write a bare int as 1/0, and the
+    index would then see a number where it expects true/false.
     """
-    if trace_col is None or _FLAG_IDS is None or len(_FLAG_IDS) == 0:
+    if trace_ids is None or not _FLAGS:
         return {f: [False] * n for f in trace_flags.FLAG_FIELDS}
-    idx = pc.index_in(trace_col, value_set=_FLAG_IDS)
-    return {f: pc.fill_null(pc.take(col, idx), False).to_pylist()
-            for f, col in _FLAG_COLS.items()}
+    get = _FLAGS.get
+    masks = [get(t, 0) for t in trace_ids]
+    return {f: [bool(m & bit) for m in masks]
+            for f, bit in zip(trace_flags.FLAG_FIELDS, trace_flags.FLAG_BITS)}
 
 
 def batch_to_documents(batch: pa.RecordBatch, id_prefix: str):
     """RecordBatch -> (document_id, dict) pairs for rvn_bulk."""
     cols = {}
-    trace_col = None
     for name in batch.schema.names:
         out = _canonical_field(name)
         if out is None:
             continue
         col = batch.column(name)
-        if out == "TraceId":
-            trace_col = col
         if pa.types.is_timestamp(col.type):
             cols[out] = _ts_iso(col)
         elif pa.types.is_map(col.type):
@@ -137,7 +138,7 @@ def batch_to_documents(batch: pa.RecordBatch, id_prefix: str):
         else:
             cols[out] = col.to_pylist()
 
-    cols.update(_trace_flags(trace_col, batch.num_rows))
+    cols.update(_trace_flags(cols.get("TraceId"), batch.num_rows))
 
     names = list(cols.keys())
     values = list(cols.values())
@@ -244,11 +245,14 @@ def main():
 
     t0 = time.monotonic()
 
-    # Before any Pool exists: these globals have to be in place at fork time.
-    global _FLAG_IDS, _FLAG_COLS
-    _FLAG_IDS, _FLAG_COLS = trace_flags.build(paths)
-    print(f"[flags] {len(_FLAG_IDS):,} traces touch payment/frontend/cart "
+    # Before any Pool exists: the table has to be in place at fork time.
+    global _FLAGS
+    _FLAGS = trace_flags.build(paths)
+    print(f"[flags] {len(_FLAGS):,} traces touch payment/frontend/cart "
           f"({time.monotonic() - t0:.1f}s)", flush=True)
+    # The forked workers share this table copy-on-write: a dict of str -> int is
+    # not tracked by the collector and lookups never write to it, so each worker
+    # keeps a few MiB of private memory (measured: 7 MiB of ~570 at 5M entries).
 
     grand = 0
     for fn, path in enumerate(paths, start=args.start_file):
